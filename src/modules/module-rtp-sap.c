@@ -220,6 +220,7 @@ struct session {
 	bool announce;
 	uint64_t timestamp;
 	bool ts_refclk_ptp;
+	bool phc_auto_identity; /* auto-detect PTP clock identity from PTP daemon */
 
 	struct impl *impl;
 	struct node *node;
@@ -672,7 +673,8 @@ static bool update_ts_refclk(struct impl *impl)
 		pw_log_warn("Unexpected PTP GET PARENT_DATA_SET response length %u, expected %zu", data_len, sizeof(struct ptp_parent_data_set));
 
 	uint8_t *cid = res.clock_identity;
-	if (memcmp(cid, impl->clock_id, 8) != 0)
+	bool cid_changed = memcmp(cid, impl->clock_id, 8) != 0;
+	if (cid_changed)
 		pw_log_info(
 			"Local clock ID: IEEE1588-2008:%02X-%02X-%02X-%02X-%02X-%02X-%02X-%02X:%d",
 			cid[0],
@@ -709,7 +711,7 @@ static bool update_ts_refclk(struct impl *impl)
 
 	memcpy(impl->clock_id, cid, 8);
 	memcpy(impl->gm_id, gmid, 8);
-	return gmid_changed;
+	return gmid_changed || cid_changed;
 }
 
 static uint16_t generate_hash(uint16_t prev)
@@ -831,17 +833,35 @@ static int make_sdp(struct impl *impl, struct session *sess, char *buffer, size_
 		spa_strbuf_append(&buf,
 			"a=framecount:%u\n", sdp->framecount);
 
-	if (sdp->ptp_clock_identity != NULL || sdp->ts_refclk != NULL || sess->ts_refclk_ptp) {
+	if (sdp->ptp_clock_identity != NULL || sess->phc_auto_identity ||
+	    sdp->ts_refclk != NULL || sess->ts_refclk_ptp) {
+		static const uint8_t zero_id[8] = {0};
+
 		/*
 		 * Priority for ts-refclk:
 		 * 1. PHC with explicit ptp_clock_identity from rtp.ptp-clock-identity
-		 * 2. PTP daemon GM ID (ts_refclk_ptp, synced to external master)
-		 * 3. Explicit ts_refclk string from sess.ts-refclk
+		 * 2. PHC auto-detected: local clock identity from PTP daemon
+		 * 3. PTP daemon GM ID (ts_refclk_ptp, synced to external master)
+		 * 4. Explicit ts_refclk string from sess.ts-refclk
 		 */
 		if (sdp->ptp_clock_identity != NULL) {
 			spa_strbuf_append(&buf,
 					"a=ts-refclk:ptp=IEEE1588-2008:%s\n",
 					sdp->ptp_clock_identity);
+		} else if (sess->phc_auto_identity &&
+			   memcmp(impl->clock_id, zero_id, 8) != 0) {
+			/* Auto-detected from PTP daemon: use local clock identity
+			 * (EUI-64 derived from NIC MAC address) */
+			spa_strbuf_append(&buf,
+					"a=ts-refclk:ptp=IEEE1588-2008:%02X-%02X-%02X-%02X-%02X-%02X-%02X-%02X\n",
+					impl->clock_id[0],
+					impl->clock_id[1],
+					impl->clock_id[2],
+					impl->clock_id[3],
+					impl->clock_id[4],
+					impl->clock_id[5],
+					impl->clock_id[6],
+					impl->clock_id[7]);
 		} else if (sess->ts_refclk_ptp && memcmp(impl->clock_id, impl->gm_id, 8) != 0) {
 			// Only broadcast the GM ID when we are synced to external time source
 			spa_strbuf_append(&buf,
@@ -1216,6 +1236,18 @@ static struct session *session_new_announce(struct impl *impl, struct node *node
 	replace_str(&sdp->ts_refclk, str);
 	str = pw_properties_get(props, "rtp.ptp-clock-identity");
 	replace_str(&sdp->ptp_clock_identity, str);
+
+	/*
+	 * When rtp.clock-source=phc but no explicit rtp.ptp-clock-identity,
+	 * auto-detect the PTP clock identity from the PTP daemon service.
+	 * The PTP daemon provides the local clock identity (EUI-64 derived
+	 * from NIC MAC address) via the management socket.
+	 */
+	str = pw_properties_get(props, "rtp.clock-source");
+	sess->phc_auto_identity = (sdp->ptp_clock_identity == NULL &&
+				   str != NULL && spa_streq(str, "phc"));
+	if (sess->phc_auto_identity)
+		update_ts_refclk(impl);
 
 	sess->ts_refclk_ptp = pw_properties_get_bool(props, "rtp.fetch-ts-refclk", false);
 	if ((str = pw_properties_get(props, PW_KEY_NODE_CHANNELNAMES)) != NULL) {
