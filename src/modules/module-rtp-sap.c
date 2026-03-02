@@ -211,6 +211,7 @@ struct sdp_info {
 	uint32_t ssrc;
 	uint32_t ts_offset;
 	char *ts_refclk;
+	char *ptp_clock_identity;  /* e.g. "00-1B-21-FF-FE-00-00-01" for PHC */
 };
 
 struct session {
@@ -351,6 +352,7 @@ static void clear_sdp_info(struct sdp_info *info)
 	free(info->media_type);
 	free(info->mime_type);
 	free(info->ts_refclk);
+	free(info->ptp_clock_identity);
 	spa_zero(*info);
 }
 
@@ -829,9 +831,19 @@ static int make_sdp(struct impl *impl, struct session *sess, char *buffer, size_
 		spa_strbuf_append(&buf,
 			"a=framecount:%u\n", sdp->framecount);
 
-	if (sdp->ts_refclk != NULL || sess->ts_refclk_ptp) {
-		// Only broadcast the GM ID when we are synced to external time source
-		if (sess->ts_refclk_ptp && memcmp(impl->clock_id, impl->gm_id, 8) != 0) {
+	if (sdp->ptp_clock_identity != NULL || sdp->ts_refclk != NULL || sess->ts_refclk_ptp) {
+		/*
+		 * Priority for ts-refclk:
+		 * 1. PHC with explicit ptp_clock_identity from rtp.ptp-clock-identity
+		 * 2. PTP daemon GM ID (ts_refclk_ptp, synced to external master)
+		 * 3. Explicit ts_refclk string from sess.ts-refclk
+		 */
+		if (sdp->ptp_clock_identity != NULL) {
+			spa_strbuf_append(&buf,
+					"a=ts-refclk:ptp=IEEE1588-2008:%s\n",
+					sdp->ptp_clock_identity);
+		} else if (sess->ts_refclk_ptp && memcmp(impl->clock_id, impl->gm_id, 8) != 0) {
+			// Only broadcast the GM ID when we are synced to external time source
 			spa_strbuf_append(&buf,
 					"a=ts-refclk:ptp=IEEE1588-2008:%02X-%02X-%02X-%02X-%02X-%02X-%02X-%02X:%d\n",
 					impl->gm_id[0],
@@ -1202,6 +1214,8 @@ static struct session *session_new_announce(struct impl *impl, struct node *node
 		sdp->ts_offset = atoi(str);
 	str = pw_properties_get(props, "rtp.ts-refclk");
 	replace_str(&sdp->ts_refclk, str);
+	str = pw_properties_get(props, "rtp.ptp-clock-identity");
+	replace_str(&sdp->ptp_clock_identity, str);
 
 	sess->ts_refclk_ptp = pw_properties_get_bool(props, "rtp.fetch-ts-refclk", false);
 	if ((str = pw_properties_get(props, PW_KEY_NODE_CHANNELNAMES)) != NULL) {

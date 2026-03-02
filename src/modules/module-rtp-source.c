@@ -32,6 +32,7 @@
 #include <pipewire/impl.h>
 
 #include <module-rtp/stream.h>
+#include <module-rtp/rtp-clock.h>
 #include "network-utils.h"
 
 /** \page page_module_rtp_source RTP source
@@ -61,6 +62,12 @@
  * - `sess.media = <string>`: the media type audio|midi|opus, default audio
  * - `sess.ts-direct = <bool>`: use direct timestamp mode, default false
  *                (see the Buffer Modes section below)
+ * - `rtp.clock-source = <string>`: clock source for RTP timestamps:
+ *       "monotonic" (default), "realtime", "tai", or "phc"
+ * - `rtp.phc-device = <string>`: PHC device path (e.g. "/dev/ptp0"),
+ *       required when rtp.clock-source=phc
+ * - `rtp.ptp-clock-identity = <string>`: PTP clock identity for SDP announcements
+ *       (e.g. "00-1B-21-FF-FE-00-00-01"), used with rtp.clock-source=phc
  * - `stream.may-pause = <bool>`: pause the stream when no data is reveived, default false
  * - `stream.props = {}`: properties to be passed to the stream
  *
@@ -100,6 +107,9 @@
  *         #audio.rate = 48000
  *         #audio.channels = 2
  *         #audio.position = [ FL FR ]
+ *         #rtp.clock-source = monotonic  # monotonic|realtime|tai|phc
+ *         #rtp.phc-device = /dev/ptp0    # required when rtp.clock-source=phc
+ *         #rtp.ptp-clock-identity = 00-1B-21-FF-FE-00-00-01
  *         stream.props = {
  *            #media.class = "Audio/Source"
  *            node.name = "rtp-source"
@@ -257,6 +267,8 @@ struct impl {
 	bool may_pause;
 	bool standby;
 	bool waiting;
+
+	struct rtp_clock rtp_clk;
 };
 
 static inline uint64_t get_time_ns(struct impl *impl)
@@ -265,9 +277,7 @@ static inline uint64_t get_time_ns(struct impl *impl)
 	if (impl->stream) {
 		res = rtp_stream_get_nsec(impl->stream);
 	} else {
-		struct timespec ts;
-		clock_gettime(CLOCK_MONOTONIC, &ts);
-		res = SPA_TIMESPEC_TO_NSEC(&ts);
+		res = rtp_clock_gettime_ns(&impl->rtp_clk);
 	}
 	return res;
 }
@@ -834,6 +844,8 @@ static void impl_destroy(struct impl *impl)
 	pw_timer_queue_cancel(&impl->stream_start_retry_timer);
 	pw_timer_queue_cancel(&impl->igmp_recovery.timer);
 
+	rtp_clock_destroy(&impl->rtp_clk);
+
 	if (impl->data_loop)
 		pw_context_release_loop(impl->context, impl->data_loop);
 
@@ -958,6 +970,9 @@ int pipewire__module_init(struct pw_impl_module *module, const char *args)
 	copy_props(impl, props, "sess.ts-direct");
 	copy_props(impl, props, "sess.ignore-ssrc");
 	copy_props(impl, props, "stream.may-pause");
+	copy_props(impl, props, "rtp.clock-source");
+	copy_props(impl, props, "rtp.phc-device");
+	copy_props(impl, props, "rtp.ptp-clock-identity");
 
 	str = pw_properties_get(props, "local.ifname");
 	impl->ifname = str ? strdup(str) : NULL;
@@ -987,6 +1002,11 @@ int pipewire__module_init(struct pw_impl_module *module, const char *args)
 	if (ts_offset == -1)
 		ts_offset = pw_rand32();
 	pw_properties_setf(stream_props, "rtp.receiver-ts-offset", "%u", (uint32_t)ts_offset);
+
+	/* Initialize the RTP clock source */
+	rtp_clock_init(&impl->rtp_clk,
+		       pw_properties_get(props, "rtp.clock-source"),
+		       pw_properties_get(props, "rtp.phc-device"));
 
 	impl->always_process = pw_properties_get_bool(stream_props,
 			PW_KEY_NODE_ALWAYS_PROCESS, true);

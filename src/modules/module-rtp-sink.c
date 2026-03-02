@@ -27,6 +27,7 @@
 #include <pipewire/impl.h>
 
 #include <module-rtp/stream.h>
+#include <module-rtp/rtp-clock.h>
 #include "network-utils.h"
 
 #ifndef IPTOS_DSCP
@@ -65,6 +66,12 @@
  * - `sess.ts-offset = <int>`: an offset to apply to the timestamp, default -1 = random offset
  * - `sess.ts-refclk = <string>`: the name of a reference clock
  * - `sess.media = <string>`: the media type audio|midi|opus, default audio
+ * - `rtp.clock-source = <string>`: clock source for RTP timestamps:
+ *       "monotonic" (default), "realtime", "tai", or "phc"
+ * - `rtp.phc-device = <string>`: PHC device path (e.g. "/dev/ptp0"),
+ *       required when rtp.clock-source=phc
+ * - `rtp.ptp-clock-identity = <string>`: PTP clock identity for SDP announcements
+ *       (e.g. "00-1B-21-FF-FE-00-00-01"), used with rtp.clock-source=phc
  * - `stream.props = {}`: properties to be passed to the stream
  * - `aes67.driver-group = <string>`: for AES67 streams, can be specified in order to allow
  *       the sink to be driven by a different node than the PTP driver.
@@ -109,6 +116,9 @@
  *         #audio.rate = 48000
  *         #audio.channels = 2
  *         #audio.position = [ FL FR ]
+ *         #rtp.clock-source = monotonic  # monotonic|realtime|tai|phc
+ *         #rtp.phc-device = /dev/ptp0    # required when rtp.clock-source=phc
+ *         #rtp.ptp-clock-identity = 00-1B-21-FF-FE-00-00-01
  *         stream.props = {
  *             node.name = "rtp-sink"
  *         }
@@ -196,6 +206,8 @@ struct impl {
 	socklen_t dst_len;
 
 	int rtp_fd;
+
+	struct rtp_clock rtp_clk;
 };
 
 static bool is_multicast(struct sockaddr *sa, socklen_t salen)
@@ -284,11 +296,9 @@ static void stream_destroy(void *d)
 	impl->stream = NULL;
 }
 
-static inline uint64_t get_time_ns(void)
+static inline uint64_t get_time_ns(struct impl *impl)
 {
-	struct timespec ts;
-	clock_gettime(CLOCK_MONOTONIC, &ts);
-	return SPA_TIMESPEC_TO_NSEC(&ts);
+	return rtp_clock_gettime_ns(&impl->rtp_clk);
 }
 
 static void stream_send_packet(void *data, struct iovec *iov, size_t iovlen)
@@ -307,7 +317,7 @@ static void stream_send_packet(void *data, struct iovec *iov, size_t iovlen)
 	n = sendmsg(impl->rtp_fd, &msg, MSG_NOSIGNAL);
 	if (n < 0) {
 		int suppressed;
-		if ((suppressed = spa_ratelimit_test(&impl->rate_limit, get_time_ns())) >= 0)
+		if ((suppressed = spa_ratelimit_test(&impl->rate_limit, get_time_ns(impl))) >= 0)
 			pw_log_warn("(%d suppressed) sendmsg() failed: %m", suppressed);
 	}
 }
@@ -472,6 +482,8 @@ static void impl_destroy(struct impl *impl)
 		close(impl->rtp_fd);
 	}
 
+	rtp_clock_destroy(&impl->rtp_clk);
+
 	pw_properties_free(impl->stream_props);
 	pw_properties_free(impl->props);
 
@@ -600,6 +612,9 @@ int pipewire__module_init(struct pw_impl_module *module, const char *args)
 	copy_props(impl, props, "sess.latency.msec");
 	copy_props(impl, props, "sess.ts-refclk");
 	copy_props(impl, props, "aes67.driver-group");
+	copy_props(impl, props, "rtp.clock-source");
+	copy_props(impl, props, "rtp.phc-device");
+	copy_props(impl, props, "rtp.ptp-clock-identity");
 
 	str = pw_properties_get(props, "local.ifname");
 	impl->ifname = str ? strdup(str) : NULL;
@@ -628,6 +643,11 @@ int pipewire__module_init(struct pw_impl_module *module, const char *args)
 	if (ts_offset == -1)
 		ts_offset = pw_rand32();
 	pw_properties_setf(stream_props, "rtp.sender-ts-offset", "%u", (uint32_t)ts_offset);
+
+	/* Initialize the RTP clock source */
+	rtp_clock_init(&impl->rtp_clk,
+		       pw_properties_get(props, "rtp.clock-source"),
+		       pw_properties_get(props, "rtp.phc-device"));
 
 	header_size = impl->dst_addr.ss_family == AF_INET ?
                         IP4_HEADER_SIZE : IP6_HEADER_SIZE;
