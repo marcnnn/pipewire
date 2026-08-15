@@ -597,7 +597,7 @@ summary({'zeroconf-discover': build_module_zeroconf_discover}, bool_yn: true, se
 # (by avoiding build script code duplication), create a static library
 # that contains that common code.
 pipewire_module_rtp_common_lib = static_library('pipewire-module-rtp-common-lib',
-  [ 'module-rtp/stream.c' ],
+  [ 'module-rtp/stream.c', 'module-rtp/rtp-clock.c' ],
   include_directories : [configinc],
   install : false,
   dependencies : [mathlib, dl_lib, rt_lib, pipewire_dep, opus_dep],

@@ -354,6 +354,21 @@ static int rtp_audio_receive(struct impl *impl, uint8_t *buffer, ssize_t len,
 	impl->seq = seq + 1;
 	impl->have_seq = true;
 
+	/* If an alternative clock source was configured (rtp.clock-source) and we
+	 * run in direct timestamp mode, derive the offset between the incoming
+	 * timestamps and the local clock position from that clock, instead of
+	 * relying on the offset that the sender announced. This has to happen
+	 * before the timestamp is translated below. rtp_audio_process_playback()
+	 * reads at the (scaled) clock position, so that is the local timestamp
+	 * that the offset has to be relative to. */
+	if (SPA_UNLIKELY(!impl->have_sync && impl->direct_timestamp &&
+				impl->io_position != NULL &&
+				impl->io_position->clock.rate.denom != 0)) {
+		rtp_stream_rebase_ts_offset(impl,
+				(uint32_t)scale_u64(impl->io_position->clock.position,
+					impl->rate, impl->io_position->clock.rate.denom));
+	}
+
 	timestamp = ntohl(hdr->timestamp) - impl->ts_offset;
 
 	impl->receiving = true;
@@ -719,6 +734,12 @@ static void rtp_audio_process_capture(void *data)
 	if (!impl->have_sync) {
 		if (!impl->direct_timestamp)
 			impl->ts_align = actual_timestamp - impl->ring.readindex;
+		/* If an alternative clock source was configured (rtp.clock-source),
+		 * express the outgoing timestamps in the time base of that clock.
+		 * The value that rtp_audio_send_packets() adds to ts_offset is
+		 * (ts_align + ring read index), and the read index is set to
+		 * actual_timestamp right below. */
+		rtp_stream_rebase_ts_offset(impl, actual_timestamp + impl->ts_align);
 		pw_log_info("(re)sync to timestamp:%u seq:%u ts_offset:%u ts_align:%u SSRC:%u",
 				actual_timestamp, impl->seq, impl->ts_offset, impl->ts_align, impl->ssrc);
 		spa_ringbuffer_read_update(&impl->ring, actual_timestamp);

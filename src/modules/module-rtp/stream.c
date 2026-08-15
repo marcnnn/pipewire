@@ -25,6 +25,7 @@
 #include <pipewire/impl.h>
 
 #include <module-rtp/rtp.h>
+#include <module-rtp/rtp-clock.h>
 #include <module-rtp/stream.h>
 #include <module-rtp/apple-midi.h>
 
@@ -212,7 +213,59 @@ struct impl {
 
 	/* The process latency, set by on_stream_param_changed(). */
 	struct spa_process_latency_info process_latency;
+
+	/* Clock that the RTP timestamps are based on. Only relevant if it is
+	 * an "external" clock, that is, a clock that is not the same time base
+	 * as the graph driver clock. See rtp_stream_rebase_ts_offset(). */
+	struct rtp_clock ts_clock;
 };
+
+/* Re-base impl->ts_offset so that the RTP timestamps that this stream emits
+ * (or, for a receiver, expects) are expressed in the time base of
+ * impl->ts_clock instead of the time base of the graph driver clock.
+ *
+ * Both the sender and the receiver relate the RTP timestamp of a sample to a
+ * local timestamp (derived from spa_io_clock::position) via
+ *
+ *     rtp timestamp = impl->ts_offset + local_timestamp
+ *
+ * so sampling the configured clock at a moment where the corresponding local
+ * timestamp is known gives the offset between the two time bases.
+ *
+ * This is a no-op unless rtp.clock-source selected a clock other than the
+ * default one. It is only called at (re)synchronization points, never per
+ * cycle: reading a PHC is a syscall into the NIC driver and is not cheap.
+ *
+ * Note that this only aligns the RTP timestamp *epoch* with the configured
+ * clock. The rate at which the timestamps advance is still the rate of the
+ * graph driver, so if that driver does not run off the same clock, the
+ * timestamps slowly drift away again until the next resync. Running the
+ * graph driver on the PTP hardware clock (the support.node.driver SPA node
+ * with clock.device/clock.interface, see pipewire-aes67.conf) is the proper
+ * fix for that; this here is for the case where that is not possible.
+ */
+static void rtp_stream_rebase_ts_offset(struct impl *impl, uint32_t local_timestamp)
+{
+	uint64_t nsec;
+	uint32_t clock_timestamp;
+
+	if (SPA_LIKELY(!rtp_clock_is_external(&impl->ts_clock)))
+		return;
+
+	if ((nsec = rtp_clock_gettime_ns(&impl->ts_clock)) == 0) {
+		pw_log_warn("could not read the configured rtp.clock-source, "
+				"keeping ts_offset:%u", impl->ts_offset);
+		return;
+	}
+
+	/* RTP timestamps are 32 bit and wrap around, so both the truncation
+	 * and the unsigned subtraction below are intentional. */
+	clock_timestamp = (uint32_t)rtp_clock_ns_to_samples(nsec, impl->rate);
+	impl->ts_offset = clock_timestamp - local_timestamp;
+
+	pw_log_info("rebased ts_offset to %u (clock timestamp:%u local timestamp:%u)",
+			impl->ts_offset, clock_timestamp, local_timestamp);
+}
 
 /* Atomic internal_state accessors.
  *
@@ -667,6 +720,8 @@ struct rtp_stream *rtp_stream_new(struct pw_core *core,
 		goto out;
 	}
 	impl->first = true;
+	/* calloc() would leave this at 0, which is a valid fd */
+	impl->ts_clock.phc_fd = -1;
 	set_internal_stream_state(impl, RTP_STREAM_INTERNAL_STATE_STOPPED);
 	spa_hook_list_init(&impl->listener_list);
 	impl->direction = direction;
@@ -833,6 +888,34 @@ struct rtp_stream *rtp_stream_new(struct pw_core *core,
 			impl->direct_timestamp = false;
 	}
 
+	/* Select the clock that the RTP timestamps are based on. The default
+	 * ("monotonic") keeps the timestamps derived from the graph driver
+	 * clock, which is what upstream always did. Anything else makes
+	 * rtp_stream_rebase_ts_offset() re-base impl->ts_offset onto that
+	 * clock at every (re)sync. */
+	rtp_clock_init(&impl->ts_clock,
+			pw_properties_get(props, "rtp.clock-source"),
+			pw_properties_get(props, "rtp.phc-device"));
+
+	if (rtp_clock_is_external(&impl->ts_clock)) {
+		if (direction == PW_DIRECTION_INPUT) {
+			/* The emitted timestamps directly express the time of the
+			 * configured reference clock, so the media clock has no
+			 * offset relative to it. This is what gets announced as
+			 * "a=mediaclk:direct=0" by module-rtp-sap. The effective
+			 * offset against the graph clock is only known once the
+			 * stream is running; see rtp_stream_rebase_ts_offset(). */
+			impl->ts_offset = 0;
+			pw_properties_set(props, "rtp.ts-offset", "0");
+		} else {
+			/* The receiver derives the offset from its own clock, so
+			 * the sender announced offset (if any) is not needed to
+			 * run in direct timestamp mode. */
+			impl->direct_timestamp = pw_properties_get_bool(props,
+					"sess.ts-direct", impl->direct_timestamp);
+		}
+	}
+
 	impl->payload = pw_properties_get_uint32(props, "rtp.payload", impl->payload);
 	impl->mtu = pw_properties_get_uint32(props, "net.mtu", DEFAULT_MTU);
 	impl->header_size = pw_properties_get_uint32(props, "net.header", IP4_HEADER_SIZE + UDP_HEADER_SIZE);
@@ -991,6 +1074,16 @@ struct rtp_stream *rtp_stream_new(struct pw_core *core,
 		goto out;
 	}
 
+	if (impl->separate_sender && rtp_clock_is_external(&impl->ts_clock)) {
+		/* With aes67.driver-group, the separate sender is already driven by
+		 * the PTP driver node, and it derives the RTP timestamps from that
+		 * driver's clock position. Re-basing them on another clock on top of
+		 * that would only add an error. */
+		pw_log_warn("rtp.clock-source is ignored when aes67.driver-group is set; "
+				"the timestamps are taken from the PTP driver clock");
+		rtp_clock_destroy(&impl->ts_clock);
+	}
+
 	if (process_latency_from_sess) {
 		/* If process.latency.from.sess is set to true, then the sess.latency.msec
 		 * quantity is to be set as the process latency at startup. But since the
@@ -1046,6 +1139,9 @@ out:
 			pw_stream_destroy(impl->stream);
 		if (impl->data_loop)
 			pw_context_release_loop(impl->context, impl->data_loop);
+		/* phc_fd is set to -1 right after the allocation, so this is
+		 * safe on every path that can reach this label with impl set */
+		rtp_clock_destroy(&impl->ts_clock);
 		free(impl);
 	}
 	errno = -res;
@@ -1075,6 +1171,8 @@ void rtp_stream_destroy(struct rtp_stream *s)
 
 	if (impl->buffer)
 		free(impl->buffer);
+
+	rtp_clock_destroy(&impl->ts_clock);
 
 	spa_hook_list_clean(&impl->listener_list);
 	free(impl);

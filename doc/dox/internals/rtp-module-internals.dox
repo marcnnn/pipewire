@@ -332,4 +332,47 @@ inherently aligned. It is therefore important to check that the filter wakes
 up within the bounds of the sink node's wake up times (with some tolerance);
 if it does not, a resynchronization is performed.
 
+# RTP timestamp clock source {#rtp-module-internals-clock-source}
+
+By default, the RTP timestamps are derived purely from \ref spa_io_clock::position ,
+that is, from the clock of the graph driver. The sender computes
+
+    rtp timestamp = impl->ts_offset + impl->ts_align + (ring buffer index)
+
+where the ring buffer index tracks the driver's clock position, and the receiver
+inverts this. `impl->ts_offset` is a random value for a sender (or the value the
+sender announced, for a receiver), so the timestamps have an arbitrary epoch.
+
+For AES67 and similar interoperability cases, the RTP timestamp is required to be
+the PTP time expressed in sample units. The proper way to get that is to make the
+graph driver itself run on the PTP hardware clock (PHC): the `support.node.driver`
+SPA node accepts `clock.device` (e.g. `/dev/ptp0`), `clock.interface` (from which
+it looks up the PHC index via ethtool) or `clock.id` (e.g. `tai`), and
+`pipewire-aes67.conf` sets exactly this up. Then \ref spa_io_clock::position
+*is* PTP time, and nothing else is needed. The separate PTP sender (see above)
+builds on this too.
+
+The `rtp.clock-source` / `rtp.phc-device` stream properties exist for the case
+where that is not possible - for example when the RTP sink has to stay in a graph
+that is driven by an ALSA device or by the dummy driver, and only the timestamps
+(not the graph pacing) should follow the PTP clock. `rtp_clock_init()` in
+`rtp-clock.c` opens the requested clock (a PHC is turned into a `clockid_t` with
+the usual `FD_TO_CLOCKID()` formula), and `rtp_stream_rebase_ts_offset()` in
+`stream.c` then recomputes `impl->ts_offset` at every (re)synchronization point,
+so that the emitted (or expected) timestamps are expressed in the time base of
+that clock.
+
+\note This only aligns the *epoch*. The timestamps keep advancing at the rate of
+the graph driver, so they drift away from the configured clock again between
+resynchronizations, at the rate difference between the two clocks. This is
+inherent - correcting the rate as well means driving the graph from that clock,
+which is exactly what the PHC graph driver does. `rtp.clock-source` is therefore
+ignored when `aes67.driver-group` is set, since in that mode the timestamps
+already come from the PTP driver clock.
+
+On the receiver side the re-basing is only done in the direct timestamp mode. In
+the constant latency mode the ring buffer indices are self-referential (the read
+index is derived from the write index and the target fill level, not from the
+clock position), so the value of `impl->ts_offset` does not matter there.
+
 */

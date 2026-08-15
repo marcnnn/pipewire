@@ -76,9 +76,16 @@
  *                     \note RTP sources that use direct timestamp mode expect the
  *                     associated RTP sink to use direct timestamp mode as well. See the
  *                     `sess.ts-direct` documentation in \ref page_module_rtp_source for more.
+ * - `rtp.clock-source = <string>`: the clock that the RTP timestamps are based on:
+ *       `monotonic` (default), `realtime`, `tai` or `phc`. Anything but the default
+ *       re-bases the outgoing timestamps onto that clock. See
+ *       \ref rtp-module-internals-clock-source for when this is (and is not) useful.
+ * - `rtp.phc-device = <string>`: the PTP hardware clock device (e.g. `/dev/ptp0`) to use,
+ *       required when `rtp.clock-source = phc`. Ignored otherwise.
  * - `stream.props = {}`: properties to be passed to the stream
  * - `aes67.driver-group = <string>`: for AES67 streams, can be specified in order to allow
  *       the sink to be driven by a different node than the PTP driver.
+ *       `rtp.clock-source` is ignored when this is set.
  *
  * ### Additional information about `source.ip` and `local.ifname`
  *
@@ -1219,6 +1226,8 @@ int pipewire__module_init(struct pw_impl_module *module, const char *args)
 	copy_props(impl, props, "sess.ts-direct");
 	copy_props(impl, props, "sess.ts-refclk");
 	copy_props(impl, props, "aes67.driver-group");
+	copy_props(impl, props, "rtp.clock-source");
+	copy_props(impl, props, "rtp.phc-device");
 
 	if ((res = setup_rtp_target_from_props(&initial_target, props, &initial_target_valid)) < 0) {
 		pw_log_error("could not setup initial destination: %s", spa_strerror(res));

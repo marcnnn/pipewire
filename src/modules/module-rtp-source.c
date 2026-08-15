@@ -64,6 +64,14 @@
  * - `sess.media = <string>`: the media type audio|midi|opus, default audio
  * - `sess.ts-direct = <bool>`: use direct timestamp mode, default false
  *                (see the Buffer Modes section below)
+ * - `rtp.clock-source = <string>`: the clock that the RTP timestamps are based on:
+ *       `monotonic` (default), `realtime`, `tai` or `phc`. Anything but the default
+ *       makes the receiver derive the offset between the incoming timestamps and its
+ *       own clock position from that clock instead of from the offset announced by
+ *       the sender. This only has an effect in direct timestamp mode. See
+ *       \ref rtp-module-internals-clock-source for details.
+ * - `rtp.phc-device = <string>`: the PTP hardware clock device (e.g. `/dev/ptp0`) to use,
+ *       required when `rtp.clock-source = phc`. Ignored otherwise.
  * - `stream.may-pause = <bool>`: pause the stream when no data is reveived, default false
  * - `stream.props = {}`: properties to be passed to the stream
  *
@@ -1019,6 +1027,8 @@ int pipewire__module_init(struct pw_impl_module *module, const char *args)
 	copy_props(impl, props, "sess.ts-direct");
 	copy_props(impl, props, "sess.ignore-ssrc");
 	copy_props(impl, props, "stream.may-pause");
+	copy_props(impl, props, "rtp.clock-source");
+	copy_props(impl, props, "rtp.phc-device");
 
 	str = pw_properties_get(props, "local.ifname");
 	impl->ifname = str ? strdup(str) : NULL;
